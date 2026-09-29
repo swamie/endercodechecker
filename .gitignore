@@ -1,0 +1,10 @@
+token.txt
+token_*.json
+grabber_config.json
+*.png
+__pycache__/
+.claude/
+CLAUDE.md
+hi.py
+token_wam.py
+test_token.py

@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, Response
-import asyncio, aiohttp, json, threading, queue, time, os, uuid, re
+import asyncio, aiohttp, json, threading, queue, time, os, uuid, re, random
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from bs4 import BeautifulSoup
@@ -8,7 +8,9 @@ from bs4 import BeautifulSoup
 
 TOKEN_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
 OUTPUT_DIR  = os.path.dirname(os.path.abspath(__file__))   # results saved next to dashboard.py
-RATE_DELAY  = 0.5  # seconds between uses of the same token (reduced for Minecraft cape checks)
+RATE_DELAY      = 0.3   # baseline seconds between uses of the same token
+RATE_DELAY_MAX  = 4.0   # ceiling an adaptive token delay can reach
+RATE_DELAY_MIN  = 0.2   # floor — never go faster than this
 GMT1        = timezone(timedelta(hours=1))
 
 app = Flask(__name__)
@@ -29,19 +31,41 @@ STATUS_MAP = {
 # ─── Token Management ─────────────────────────────────────────────────────────
 
 def load_tokens():
-    """Reload token pool from disk, preserving usage/rate-limit state."""
+    """
+    Reload token pool from disk, preserving usage/rate-limit state.
+    New tokens get staggered initial next_use so they never all fire
+    simultaneously — the #1 cause of synchronized 429 waves.
+    """
     existing = {tok.token: tok for tok in token_pool}
     lines = []
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE) as f:
             lines = f.readlines()
 
-    token_pool[:] = [
-        existing.get(line.strip())
-        or SimpleNamespace(token=line.strip(), next_use=0, rate_reset=0)
-        for line in lines
-        if line.strip()
-    ]
+    fresh = []
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        if raw in existing:
+            fresh.append(existing[raw])
+        else:
+            fresh.append(SimpleNamespace(
+                token=raw,
+                next_use=0,
+                rate_reset=0,
+                delay=RATE_DELAY,   # per-token adaptive delay
+                streak=0,           # consecutive successful requests
+            ))
+
+    # Stagger initial scheduling: spread tokens evenly across one RATE_DELAY window
+    n = len(fresh)
+    now = time.monotonic()
+    for i, tok in enumerate(fresh):
+        if tok.next_use == 0:          # only touch brand-new tokens
+            tok.next_use = now + i * (RATE_DELAY / max(n, 1))
+
+    token_pool[:] = fresh
 
 
 load_tokens()
@@ -198,18 +222,20 @@ async def check_key(session, key):
     rate_limit_hits = 0
     errors = 0
 
-    while rate_limit_hits < 8 and errors < 3:
+    while rate_limit_hits < 5 and errors < 3:
         now = time.monotonic()
         available = [tok for tok in token_pool if now >= tok.rate_reset]
 
         if not available:
+            # Wait for the soonest token, with a small jitter so workers
+            # don't all wake up and fire at the exact same millisecond
             wait = min(tok.rate_reset for tok in token_pool) - now
-            await asyncio.sleep(max(0.5, wait))
+            await asyncio.sleep(max(0.1, wait) + random.uniform(0, 0.05))
             continue
 
-        # Pick the token that was used least recently
-        tok = min(available, key=lambda t: t.next_use)
-        scheduled = max(now, tok.next_use + RATE_DELAY)
+        # Pick soonest-available token; use its own adaptive delay + tiny jitter
+        tok = min(available, key=lambda t: t.next_use + t.delay)
+        scheduled = max(now, tok.next_use + tok.delay + random.uniform(0, 0.02))
         tok.next_use = scheduled
 
         if scheduled > now:
@@ -223,36 +249,36 @@ async def check_key(session, key):
             async with session.get(
                 url,
                 headers={"Authorization": tok.token},
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 429:
                     rate_limit_hits += 1
                     retry_after = resp.headers.get("Retry-After", "")
-                    backoff = int(retry_after) if retry_after.isdigit() else 0
-                    tok.rate_reset = time.monotonic() + max(backoff, 30 * rate_limit_hits)
+                    server_hint  = int(retry_after) if retry_after.isdigit() else 0
+                    # Slow this token down adaptively — it gets faster again on success streaks
+                    tok.delay    = min(tok.delay * 1.5, RATE_DELAY_MAX)
+                    tok.streak   = 0
+                    tok.rate_reset = time.monotonic() + max(server_hint, tok.delay * 2)
                     continue
 
                 if resp.status == 200:
-                    data = await resp.json()
+                    data  = await resp.json()
                     state = str(data.get("tokenState", "Unknown"))
 
+                    # This token handled a request cleanly — reward it
+                    tok.streak += 1
+                    if tok.streak >= 15 and tok.delay > RATE_DELAY_MIN:
+                        tok.delay  = max(RATE_DELAY_MIN, tok.delay * 0.92)
+                        tok.streak = 0
+
                     if state.lower() == "redeemed":
-                        # Log first redeemed response for debugging
                         if not seen_redeemed:
                             seen_redeemed.append(1)
-                            print(
-                                "First redeemed response:",
-                                json.dumps(data)[:800],
-                                flush=True,
-                            )
+                            print("First redeemed response:", json.dumps(data)[:800], flush=True)
 
                         redeem_date = find_redeem_date(data)
-
-                        # Fall back to Office page if no date found via API
                         if not redeem_date:
-                            _, office_kind, office_date = await check_office_redemption(
-                                session, key
-                            )
+                            _, office_kind, office_date = await check_office_redemption(session, key)
                             if office_kind == "redeemed":
                                 redeem_date = office_date
 
@@ -324,8 +350,9 @@ async def run_batch(keys, result_queue, state):
         result_queue.put({"type": "done"})
         return
 
-    # One slot per token, so all tokens stay busy without thrashing
-    concurrency = max(len(token_pool) * 4, 20)
+    # 3 workers per token: one in-flight, one queued, one about to grab the slot.
+    # Keeps every token fully saturated with no gap between requests.
+    concurrency = max(len(token_pool) * 3, 6)
     semaphore   = asyncio.Semaphore(concurrency)
 
     async def process_one(session, key):

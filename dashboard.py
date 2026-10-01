@@ -1,5 +1,5 @@
-from flask import Flask, request, jsonify, Response
-import asyncio, aiohttp, json, threading, queue, time, os, uuid, re, random
+from flask import Flask, request, jsonify, Response, session
+import asyncio, aiohttp, json, threading, queue, time, os, uuid, re, random, hashlib
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
 from bs4 import BeautifulSoup
@@ -9,11 +9,32 @@ from bs4 import BeautifulSoup
 TOKEN_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
 OUTPUT_DIR  = os.path.dirname(os.path.abspath(__file__))   # results saved next to dashboard.py
 RATE_DELAY      = 0.3   # baseline seconds between uses of the same token
-RATE_DELAY_MAX  = 4.0   # ceiling an adaptive token delay can reach
+RATE_DELAY_MAX  = 2.0   # ceiling an adaptive token delay can reach (lowered — recovery was too slow at 4s)
 RATE_DELAY_MIN  = 0.2   # floor — never go faster than this
 GMT1        = timezone(timedelta(hours=1))
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)   # session signing — regenerated each restart (local use)
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+# Key stored as its SHA-256 digest — plaintext never appears in source.
+# Byte sequence 101-110-100-101-114 is the activation key in ASCII ordinals.
+_AUTH_HASH = hashlib.sha256(bytes([101,110,100,101,114])).hexdigest()
+
+@app.before_request
+def _gate():
+    free = {"/", "/api/unlock"}
+    if request.path in free or session.get("unlocked"):
+        return
+    return jsonify(error="unauthorized"), 401
+
+@app.route("/api/unlock", methods=["POST"])
+def api_unlock():
+    key = (request.json or {}).get("key", "").strip()
+    if hashlib.sha256(key.encode()).hexdigest() == _AUTH_HASH:
+        session["unlocked"] = True
+        return jsonify(ok=True)
+    return jsonify(ok=False, error="Invalid activation key"), 403
 
 # In-memory state
 token_pool: list = []
@@ -56,6 +77,7 @@ def load_tokens():
                 rate_reset=0,
                 delay=RATE_DELAY,   # per-token adaptive delay
                 streak=0,           # consecutive successful requests
+                frozen=False,       # True while in a 429 cooldown
             ))
 
     # Stagger initial scheduling: spread tokens evenly across one RATE_DELAY window
@@ -255,21 +277,27 @@ async def check_key(session, key):
                     rate_limit_hits += 1
                     retry_after = resp.headers.get("Retry-After", "")
                     server_hint  = int(retry_after) if retry_after.isdigit() else 0
-                    # Slow this token down adaptively — it gets faster again on success streaks
-                    tok.delay    = min(tok.delay * 1.5, RATE_DELAY_MAX)
+                    tok.delay    = min(tok.delay * 2, RATE_DELAY_MAX)
                     tok.streak   = 0
-                    tok.rate_reset = time.monotonic() + max(server_hint, tok.delay * 2)
+                    tok.frozen   = True
+                    tok.rate_reset = time.monotonic() + max(server_hint, tok.delay)
                     continue
 
                 if resp.status == 200:
                     data  = await resp.json()
                     state = str(data.get("tokenState", "Unknown"))
 
-                    # This token handled a request cleanly — reward it
-                    tok.streak += 1
-                    if tok.streak >= 15 and tok.delay > RATE_DELAY_MIN:
-                        tok.delay  = max(RATE_DELAY_MIN, tok.delay * 0.92)
-                        tok.streak = 0
+                    # First clean request after a freeze → snap straight back to baseline
+                    # (don't crawl back — that took 465+ requests before)
+                    if tok.frozen:
+                        tok.delay  = RATE_DELAY
+                        tok.frozen = False
+                    else:
+                        # Extended clean run → nudge slightly faster (toward floor)
+                        tok.streak += 1
+                        if tok.streak >= 30 and tok.delay > RATE_DELAY_MIN:
+                            tok.delay  = max(RATE_DELAY_MIN, tok.delay * 0.95)
+                            tok.streak = 0
 
                     if state.lower() == "redeemed":
                         if not seen_redeemed:
@@ -529,6 +557,75 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hermes</title>
 <style>
+  /* ── Lock screen ── */
+  #lock-screen {
+    position: fixed; inset: 0; z-index: 9999;
+    background: #07090f;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 20px;
+    transition: opacity .4s;
+  }
+  #lock-screen.hidden { opacity: 0; pointer-events: none; }
+  .lock-box {
+    background: #0d1120; border: 1px solid #1c2740; border-radius: 14px;
+    padding: 36px 40px; display: flex; flex-direction: column;
+    align-items: center; gap: 16px; width: 340px;
+  }
+  .lock-title { font-family: system-ui,sans-serif; font-size: 18px; font-weight: 700; color: #e2e8f0; letter-spacing: .03em; }
+  .lock-sub   { font-family: system-ui,sans-serif; font-size: 12px; color: #64748b; }
+  .lock-input {
+    width: 100%; padding: 10px 14px; background: #111826; border: 1px solid #1c2740;
+    border-radius: 8px; font-family: 'Courier New', monospace; font-size: 14px;
+    color: #e2e8f0; outline: none; text-align: center; letter-spacing: .1em;
+    transition: border-color .15s;
+  }
+  .lock-input:focus { border-color: #3b7ff5; }
+  .lock-btn {
+    width: 100%; padding: 10px; background: #3b7ff5; border: none; border-radius: 8px;
+    color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; font-family: system-ui,sans-serif;
+    transition: background .15s;
+  }
+  .lock-btn:hover { background: #2563d4; }
+  .lock-err { font-family: system-ui,sans-serif; font-size: 12px; color: #ef4444; min-height: 16px; }
+
+  /* ── Completion modal ── */
+  #done-modal {
+    position: fixed; inset: 0; z-index: 8888;
+    background: rgba(7,9,15,.75); backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none; transition: opacity .3s;
+  }
+  #done-modal.visible { opacity: 1; pointer-events: all; }
+  .done-box {
+    background: #0d1120; border: 1px solid #1c2740; border-radius: 16px;
+    padding: 32px 36px; width: 380px; display: flex; flex-direction: column; gap: 20px;
+    box-shadow: 0 24px 64px rgba(0,0,0,.6);
+  }
+  .done-head { display: flex; align-items: center; justify-content: space-between; }
+  .done-title { font-size: 15px; font-weight: 700; color: #e2e8f0; }
+  .done-close { background: none; border: none; color: #64748b; font-size: 18px; cursor: pointer; line-height: 1; padding: 2px 6px; border-radius: 4px; }
+  .done-close:hover { color: #e2e8f0; background: #161f30; }
+  .done-time { font-size: 12px; color: #64748b; font-family: 'JetBrains Mono', monospace; }
+  .done-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .done-stat {
+    background: #111826; border: 1px solid #1c2740; border-radius: 10px;
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 3px;
+  }
+  .done-stat-val { font-size: 22px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+  .done-stat-lbl { font-size: 10px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: #64748b; }
+  .done-stat.total .done-stat-val  { color: #e2e8f0; }
+  .done-stat.valid .done-stat-val  { color: var(--valid); }
+  .done-stat.redeemed .done-stat-val { color: var(--redeemed); }
+  .done-stat.invalid .done-stat-val  { color: var(--invalid); }
+  .done-stat.limited .done-stat-val  { color: var(--limited); }
+  .done-stat.failed .done-stat-val   { color: var(--failed); }
+  .done-rate { font-size: 12px; color: #64748b; text-align: center; font-family: 'JetBrains Mono', monospace; }
+  .done-dismiss {
+    width: 100%; padding: 10px; background: #3b7ff5; border: none; border-radius: 8px;
+    color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; font-family: system-ui,sans-serif;
+    transition: background .15s;
+  }
+  .done-dismiss:hover { background: #2563d4; }
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
@@ -911,6 +1008,39 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+
+<!-- ── Lock screen ── -->
+<div id="lock-screen">
+  <div class="lock-box">
+    <div class="lock-title">Hermes</div>
+    <div class="lock-sub">Enter activation key to continue</div>
+    <input class="lock-input" id="lock-key" type="password" placeholder="••••••••" autocomplete="off" spellcheck="false">
+    <button class="lock-btn" id="lock-btn">Unlock</button>
+    <div class="lock-err" id="lock-err"></div>
+  </div>
+</div>
+
+<!-- ── Completion modal ── -->
+<div id="done-modal">
+  <div class="done-box">
+    <div class="done-head">
+      <span class="done-title">✓ Run Complete</span>
+      <button class="done-close" id="done-close">✕</button>
+    </div>
+    <div class="done-time" id="done-time"></div>
+    <div class="done-stats">
+      <div class="done-stat total"><div class="done-stat-val" id="ds-total">0</div><div class="done-stat-lbl">Total Checked</div></div>
+      <div class="done-stat valid"><div class="done-stat-val" id="ds-valid">0</div><div class="done-stat-lbl">Valid</div></div>
+      <div class="done-stat redeemed"><div class="done-stat-val" id="ds-redeemed">0</div><div class="done-stat-lbl">Redeemed</div></div>
+      <div class="done-stat invalid"><div class="done-stat-val" id="ds-invalid">0</div><div class="done-stat-lbl">Invalid</div></div>
+      <div class="done-stat limited"><div class="done-stat-val" id="ds-limited">0</div><div class="done-stat-lbl">Rate Limited</div></div>
+      <div class="done-stat failed"><div class="done-stat-val" id="ds-failed">0</div><div class="done-stat-lbl">Failed</div></div>
+    </div>
+    <div class="done-rate" id="done-rate"></div>
+    <button class="done-dismiss" id="done-dismiss">Dismiss</button>
+  </div>
+</div>
+
 <div class="app">
 
   <!-- ── Header ── -->
@@ -1030,6 +1160,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 let jobId, pauseState = 0, done = 0, total = 0;
 let resultMap = {}, orderedKeys = [], elementMap = {}, busy = 0, debounce;
 let firstResult = true, lastExport = null, startTime = 0;
+// Running counters — O(1) updates, no filter scans
+const counts = { valid:0, redeemed:0, invalid:0, limited:0, failed:0 };
+// Per-kind key arrays for renderSorted — no re-filter needed
+const kindKeys = { valid:[], redeemed:[], invalid:[], limited:[], failed:[] };
+const FEED_LIMIT = 300; // max live-feed rows in DOM
+let scrollPending = false;
 
 function updateCounter() {
   const n = $('codes-input').value.split('\n').filter(l => l.trim()).length;
@@ -1107,14 +1243,12 @@ function renderProgress() {
   etaEl.textContent = '≈ ' + fmtEta(eta) + ' left  ·  ' + rate.toFixed(1) + ' keys/s';
 }
 
-function countOf(k) { return orderedKeys.filter(x => resultMap[x] === k).length; }
-
 function updateStats() {
   for (const [kind] of KINDS) {
     const el = $('sn-' + kind);
-    if (el) el.textContent = countOf(kind);
+    if (el) el.textContent = counts[kind] || 0;
   }
-  const n = countOf('failed') + countOf('limited');
+  const n = (counts.failed || 0) + (counts.limited || 0);
   const btn = $('rerun-btn');
   btn.textContent = 'Re-run failed & rate limited (' + n + ')';
   btn.disabled = busy || !n;
@@ -1126,41 +1260,44 @@ function renderSorted() {
     box.innerHTML = '<div class="empty" style="padding:16px 0">No results yet</div>';
     updateStats(); return;
   }
-  box.innerHTML = '';
+  // Update existing sections in-place; build missing ones
   for (const [kind, label] of KINDS) {
-    const keys = orderedKeys.filter(k => resultMap[k] === kind);
-    if (!keys.length) continue;
-    const sec = document.createElement('div');
-    sec.className = 'sort-section';
-
-    const head = document.createElement('div');
-    head.className = 'sort-head';
-    head.innerHTML =
-      '<div class="sort-title">' +
-        '<span style="color:' + KC[kind] + '">' + label + '</span>' +
-        '<span class="sort-count" style="background:' + KB[kind] + ';color:' + KC[kind] + '">' + keys.length + '</span>' +
-      '</div>' +
-      '<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();cpKind(\'' + kind + '\',this)">Copy</button>';
-
-    const pre = document.createElement('div');
-    pre.className = 'sort-keys';
-    pre.textContent = keys.join('\n');
-    head.addEventListener('click', () => pre.classList.toggle('open'));
-
-    sec.append(head, pre);
-    box.append(sec);
+    const keys = kindKeys[kind];
+    let sec = box.querySelector('[data-kind="' + kind + '"]');
+    if (!keys.length) { if (sec) sec.remove(); continue; }
+    if (!sec) {
+      sec = document.createElement('div');
+      sec.className = 'sort-section';
+      sec.dataset.kind = kind;
+      const head = document.createElement('div');
+      head.className = 'sort-head';
+      head.innerHTML =
+        '<div class="sort-title">' +
+          '<span style="color:' + KC[kind] + '">' + label + '</span>' +
+          '<span class="sort-count" style="background:' + KB[kind] + ';color:' + KC[kind] + '"></span>' +
+        '</div>' +
+        '<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();cpKind(\'' + kind + '\',this)">Copy</button>';
+      const pre = document.createElement('div');
+      pre.className = 'sort-keys';
+      head.addEventListener('click', () => pre.classList.toggle('open'));
+      sec.append(head, pre);
+      box.append(sec);
+    }
+    sec.querySelector('.sort-count').textContent = keys.length;
+    const pre = sec.querySelector('.sort-keys');
+    if (pre.classList.contains('open')) pre.textContent = keys.join('\n');
   }
   updateStats();
 }
 
 function cpKind(kind, btn) {
-  navigator.clipboard.writeText(orderedKeys.filter(k => resultMap[k] === kind).join('\n'));
+  navigator.clipboard.writeText(kindKeys[kind].join('\n'));
   btn.textContent = 'Copied!';
   setTimeout(() => btn.textContent = 'Copy', 1200);
 }
 
 function rerunFailed() {
-  const keys = orderedKeys.filter(k => resultMap[k] === 'failed' || resultMap[k] === 'limited');
+  const keys = [...(kindKeys.failed || []), ...(kindKeys.limited || [])];
   if (keys.length) go(keys);
 }
 
@@ -1170,6 +1307,8 @@ async function go(overrideKeys) {
     overrideKeys = [...new Set($('codes-input').value.split('\n').map(x => x.trim()).filter(Boolean))];
     if (!overrideKeys.length) return;
     resultMap = {}; orderedKeys = []; elementMap = {}; firstResult = true;
+    for (const k of Object.keys(counts))  counts[k]  = 0;
+    for (const k of Object.keys(kindKeys)) kindKeys[k] = [];
     $('output').innerHTML = '<div class="empty"><div class="empty-icon">⏳</div>Checking keys…</div>';
   }
 
@@ -1197,15 +1336,34 @@ async function go(overrideKeys) {
       done++;
       if (firstResult) { firstResult = false; $('output').innerHTML = ''; }
       const key = msg.key;
+      const prevKind = resultMap[key];
+
+      // Update running counters + kind arrays
+      if (prevKind) {
+        counts[prevKind] = (counts[prevKind] || 1) - 1;
+        const arr = kindKeys[prevKind];
+        const i = arr.indexOf(key);
+        if (i !== -1) arr.splice(i, 1);
+      } else {
+        orderedKeys.push(key);
+      }
+      counts[msg.kind] = (counts[msg.kind] || 0) + 1;
+      kindKeys[msg.kind].push(key);
+      resultMap[key] = msg.kind;
+
+      // Live feed — cap at FEED_LIMIT rows
       let el = elementMap[key];
       if (!el) {
         el = elementMap[key] = document.createElement('div');
         el.className = 'result-row';
-        $('output').append(el);
-        $('output').scrollTop = $('output').scrollHeight;
-        orderedKeys.push(key);
+        const feed = $('output');
+        feed.append(el);
+        if (feed.children.length > FEED_LIMIT) feed.firstElementChild.remove();
+        if (!scrollPending) {
+          scrollPending = true;
+          requestAnimationFrame(() => { feed.scrollTop = feed.scrollHeight; scrollPending = false; });
+        }
       }
-      resultMap[key] = msg.kind;
       const d = msg.kind === 'redeemed' ? formatDate(msg.date) : '';
       el.innerHTML =
         '<span class="result-key">' + key + '</span>' +
@@ -1213,7 +1371,7 @@ async function go(overrideKeys) {
         (d ? '<span class="result-date">' + d + '</span>' : '');
       renderProgress();
       clearTimeout(debounce);
-      debounce = setTimeout(() => { renderSorted(); updateStats(); }, 300);
+      debounce = setTimeout(() => { renderSorted(); updateStats(); }, 2000);
     }
 
     if (msg.type === 'paused') {
@@ -1234,7 +1392,7 @@ async function go(overrideKeys) {
       $('check-btn').disabled = 0;
       $('export-btn').disabled = 0;
       $('eta-line').textContent = '';
-      if (msg.type === 'done') renderProgress();
+      if (msg.type === 'done') { renderProgress(); showDoneModal(); }
       renderSorted(); updateStats();
     }
   };
@@ -1279,8 +1437,69 @@ async function stopJob() {
   await fetch('/api/stop/' + jobId, { method: 'POST' });
 }
 
-fetch('/api/tokens').then(r => r.json()).then(r => setTokenLabel(r.count));
-renderSorted(); updateStats(); updateCounter();
+// ── Completion modal ─────────────────────────────────────────────────────────
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return m + 'm ' + String(r).padStart(2,'0') + 's';
+  return Math.floor(m/60) + 'h ' + String(m%60).padStart(2,'0') + 'm';
+}
+
+function showDoneModal() {
+  const elapsed = Date.now() - startTime;
+  const rate = elapsed > 0 ? (done / (elapsed / 1000)).toFixed(2) : '—';
+  $('ds-total').textContent   = done.toLocaleString();
+  $('ds-valid').textContent   = (counts.valid   || 0).toLocaleString();
+  $('ds-redeemed').textContent= (counts.redeemed|| 0).toLocaleString();
+  $('ds-invalid').textContent = (counts.invalid  || 0).toLocaleString();
+  $('ds-limited').textContent = (counts.limited  || 0).toLocaleString();
+  $('ds-failed').textContent  = (counts.failed   || 0).toLocaleString();
+  $('done-time').textContent  = 'Elapsed: ' + fmtElapsed(elapsed);
+  $('done-rate').textContent  = rate + ' keys / sec average';
+  $('done-modal').classList.add('visible');
+}
+
+['done-close','done-dismiss'].forEach(id => {
+  document.getElementById(id).addEventListener('click', () => {
+    $('done-modal').classList.remove('visible');
+  });
+});
+
+// ── Lock screen ──────────────────────────────────────────────────────────────
+(function() {
+  const ls = document.getElementById('lock-screen');
+  const inp = document.getElementById('lock-key');
+  const btn = document.getElementById('lock-btn');
+  const err = document.getElementById('lock-err');
+
+  async function tryUnlock() {
+    const key = inp.value.trim();
+    if (!key) return;
+    btn.disabled = true;
+    const r = await fetch('/api/unlock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      ls.classList.add('hidden');
+      setTimeout(() => ls.remove(), 420);
+      fetch('/api/tokens').then(r => r.json()).then(r => setTokenLabel(r.count));
+      renderSorted(); updateStats(); updateCounter();
+    } else {
+      err.textContent = 'Invalid activation key';
+      inp.value = '';
+      inp.focus();
+    }
+    btn.disabled = false;
+  }
+
+  btn.addEventListener('click', tryUnlock);
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); });
+  inp.focus();
+})();
 </script>
 </body>
 </html>"""

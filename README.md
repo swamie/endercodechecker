@@ -21,7 +21,11 @@ pip install -r requirements.txt
 
 ## Setup
 
-### 1. Add Bearer Tokens
+### 1. Activation Key
+
+Hermes requires an activation key on first launch. Enter it in the lock screen when you open the dashboard. Contact **wqp.e** (`1225822912959742099`) on Discord for the activation key.
+
+### 2. Add Bearer Tokens
 
 Create `token.txt` in the project root — one token per line:
 
@@ -32,7 +36,7 @@ Bearer EwBIBMl6BAAU...
 
 More tokens = more parallel workers = faster throughput. Add tokens through the dashboard UI or directly to `token.txt`.
 
-### 2. Run
+### 3. Run
 
 ```bash
 python dashboard.py

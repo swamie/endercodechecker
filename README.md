@@ -1,80 +1,91 @@
-# EnderCodeChecker
+# Hermes
 
-Microsoft product key checker with a live web dashboard. Validates keys against `purchase.mp.microsoft.com` with rate-limited multi-token support.
+Microsoft product key checker with a live web dashboard. Validates keys against `purchase.mp.microsoft.com` with multi-token parallel checking, live streaming results, and automatic export to `.txt`.
+
+## Requirements
+
+- Python 3.9+
+- pip
+
+## Install Dependencies
+
+```bash
+pip install flask aiohttp beautifulsoup4
+```
+
+Or all at once from the included file:
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Setup
 
-```bash
-pip install flask aiohttp playwright
-playwright install chromium
-```
+### 1. Add Bearer Tokens
 
-## Token Setup
-
-You need a valid Bearer token for `purchase.mp.microsoft.com`. Add it to `token.txt` in the project root, one token per line:
+Create `token.txt` in the project root — one token per line:
 
 ```
 Bearer EwBIBMl6BAAU...
+Bearer EwBIBMl6BAAU...
 ```
 
-More tokens = faster checking (~8 keys/min per token with 7.5s rate limit).
+More tokens = more parallel workers = faster throughput. Add tokens through the dashboard UI or directly to `token.txt`.
 
-## Usage
-
-### Web Dashboard
+### 2. Run
 
 ```bash
 python dashboard.py
 ```
 
-Open `http://localhost:5000` — paste codes, click Check, results stream in live.
+Open `http://localhost:5000`
 
-### CLI Checker
+## Usage
 
-```bash
-python file-jm4.py
+1. Paste your Bearer token(s) into **Token Management** → click **Add Tokens**
+2. Paste product keys into the **Product Keys** box (one per line)
+3. Click **▶ Check Keys** — results stream in live
+4. Use **⏸ Pause** / **■ Stop** to control the job mid-run
+5. Results are automatically exported to `.txt` when the job finishes
+
+## Output Files
+
+Two files are written to the project folder on completion:
+
+| File | Contents |
+|------|----------|
+| `{n}redeemcodes_{id}.txt` | Redeemed keys only |
+| `results_{id}.txt` | Everything else (valid, invalid, failed, rate limited) |
+
+Each line format:
+```
+KEY | Status | Redeemed: <date> | Checked: 2026-10-02 14:35:22 GMT+1
 ```
 
-Reads keys from `keys.txt`, tokens from `token.txt`, writes results to a file you specify.
+## Result Codes
 
-### Token Grabber
-
-```bash
-python token_grabber.py
-```
-
-Attempts to acquire a `purchase.mp.microsoft.com` token via Xbox Live auth chain (MSA OAuth → XBL → XSTS). Requires a registered Azure AD app with Xbox Live API permissions.
-
-### Discord Bot
-
-```bash
-python bot.py
-```
-
-Slash command `/checkcodes` opens a modal to paste and check keys. Requires a Discord bot token and `accounts.txt` with Microsoft account credentials.
+| Status | Meaning |
+|--------|---------|
+| **Not Redeemed** | Valid, unused key |
+| **Redeemed** | Already redeemed — includes date if available |
+| **Invalid** | Key doesn't exist |
+| **Auth Expired** | Bearer token needs refreshing |
+| **Wrong Country** | Key region mismatch |
+| **Rate Limited** | Auto-retried; add more tokens to avoid |
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `dashboard.py` | Flask backend with SSE streaming |
-| `index.html` | Dark-themed dashboard frontend |
-| `token_grabber.py` | Token acquisition via Xbox Live auth |
+| `dashboard.py` | Flask backend + full Hermes UI (self-contained) |
+| `token.txt` | Your Bearer tokens — gitignored, never committed |
 | `file-jm4.py` | Original async CLI key checker |
-| `bot.py` | Discord bot interface |
-| `token.txt` | Your Bearer tokens (not tracked by git) |
+| `token_grabber.py` | Token acquisition via Xbox Live auth chain |
+| `bot.py` | Discord bot interface (`/checkcodes`) |
 
 ## How It Works
 
-1. Each key is sent to `purchase.mp.microsoft.com/v7.0/tokenDescriptions/{key}`
-2. Response indicates key status: Active (not redeemed), Redeemed, Invalid, etc.
-3. Rate limiting enforces 7.5s between requests per token to avoid 429s
-4. Multiple tokens are rotated for parallel checking
-
-## Result Codes
-
-- **Not Redeemed** — valid, unused key
-- **Invalid** — key doesn't exist
-- **Auth Expired** — token needs refreshing
-- **Rate Limited** — too many requests, auto-retries
-- **Wrong Country** — key region mismatch
+1. Keys are sent concurrently to `purchase.mp.microsoft.com/v7.0/tokenDescriptions/{key}`
+2. Bearer tokens are rotated across parallel workers with per-token rate limiting
+3. Results stream to the browser in real time via Server-Sent Events
+4. On completion, results are split and saved to timestamped `.txt` files

@@ -39,6 +39,7 @@ def api_unlock():
 # In-memory state
 token_pool: list = []
 active_jobs: dict = {}
+finished_jobs: dict = {}   # job_id → records, kept after SSE stream closes
 seen_redeemed: list = []
 
 # HTTP status → (display label, kind, extra)
@@ -496,10 +497,12 @@ def toggle_pause(job_id, should_pause):
 
 @app.route("/api/export/<job_id>", methods=["POST"])
 def export_results(job_id):
-    """Re-export results for a job that is still tracked in active_jobs."""
-    if job_id not in active_jobs:
+    if job_id in active_jobs:
+        records = active_jobs[job_id][1].records
+    elif job_id in finished_jobs:
+        records = finished_jobs[job_id]
+    else:
         return jsonify(error="job not found"), 404
-    records = active_jobs[job_id][1].records
     if not records:
         return jsonify(error="no results yet"), 400
     files = write_result_files(records)
@@ -543,7 +546,9 @@ def stream_results(job_id):
             if item["type"] == "done":
                 break
 
-        active_jobs.pop(job_id, None)  # safe delete — job may already be gone
+        # Stash records so manual export still works after stream closes
+        if job_id in active_jobs:
+            finished_jobs[job_id] = active_jobs.pop(job_id)[1].records
 
     return Response(generate(), mimetype="text/event-stream")
 

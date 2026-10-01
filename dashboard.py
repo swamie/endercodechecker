@@ -329,15 +329,15 @@ async def check_key(session, key):
 
 # ─── Result File Export ───────────────────────────────────────────────────────
 
-def write_result_files(records: list) -> dict:
+def write_result_files(records: list, name: str = "") -> dict:
     """
-    Split completed records into two text files:
-      • {count}redeemcodes_{hex}.txt  — redeemed keys only
-      • results_{hex}.txt             — everything else
-    Each line: KEY | STATUS | REDEEMED DATE (if any) | CHECKED GMT+1
-    Returns dict with both filenames (or None if that bucket was empty).
+    Split completed records into two text files named after the run.
+    Format: D.M.YY-HH.MM-{name}-{count}.txt
+    Returns dict with filenames, full paths, and export directory.
     """
-    tag = uuid.uuid4().hex[:8]
+    now   = datetime.now(GMT1)
+    stamp = now.strftime("%-d.%-m.%y-%H.%M") if os.name != "nt" else now.strftime("%#d.%#m.%y-%H.%M")
+    slug  = re.sub(r"[^\w\-]", "", name.strip().lower().replace(" ", "-")) or "export"
 
     redeemed = [r for r in records if r["kind"] == "redeemed"]
     others   = [r for r in records if r["kind"] != "redeemed"]
@@ -349,16 +349,16 @@ def write_result_files(records: list) -> dict:
         parts.append(f"Checked: {r['checked_at']} GMT+1")
         return " | ".join(parts)
 
-    result = {"redeemed_file": None, "other_file": None}
+    result = {"redeemed_file": None, "other_file": None, "export_dir": OUTPUT_DIR}
 
     if redeemed:
-        fname = os.path.join(OUTPUT_DIR, f"{len(redeemed)}redeemcodes_{tag}.txt")
+        fname = os.path.join(OUTPUT_DIR, f"{stamp}-{slug}-{len(redeemed)}.txt")
         with open(fname, "w", encoding="utf-8") as f:
             f.write("\n".join(fmt(r) for r in redeemed) + "\n")
         result["redeemed_file"] = os.path.basename(fname)
 
     if others:
-        fname = os.path.join(OUTPUT_DIR, f"results_{tag}.txt")
+        fname = os.path.join(OUTPUT_DIR, f"{stamp}-{slug}-others-{len(others)}.txt")
         with open(fname, "w", encoding="utf-8") as f:
             f.write("\n".join(fmt(r) for r in others) + "\n")
         result["other_file"] = os.path.basename(fname)
@@ -427,9 +427,9 @@ async def run_batch(keys, result_queue, state):
     async with aiohttp.ClientSession(connector=connector) as session:
         await asyncio.gather(*[process_one(session, k) for k in keys])
 
-    # Write result files and notify frontend via SSE
+    # Auto-export on completion (name set later if user manually exports with a custom name)
     if state.records:
-        files = write_result_files(state.records)
+        files = write_result_files(state.records, getattr(state, "export_name", ""))
         result_queue.put({"type": "exported", **files})
 
     result_queue.put({"type": "done"})
@@ -505,8 +505,22 @@ def export_results(job_id):
         return jsonify(error="job not found"), 404
     if not records:
         return jsonify(error="no results yet"), 400
-    files = write_result_files(records)
+    name = (request.json or {}).get("name", "")
+    files = write_result_files(records, name)
     return jsonify(**files)
+
+
+@app.route("/api/open-folder", methods=["POST"])
+def open_folder():
+    import subprocess
+    try:
+        if os.name == "nt":
+            os.startfile(OUTPUT_DIR)
+        else:
+            subprocess.Popen(["open" if __import__("sys").platform == "darwin" else "xdg-open", OUTPUT_DIR])
+    except Exception:
+        pass
+    return "ok"
 
 
 @app.route("/api/stop/<job_id>", methods=["POST"])
@@ -997,6 +1011,50 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   .add-msg { font-size: 11px; color: var(--valid); }
 
+  /* ── Export name modal & confirmation ── */
+  .exp-modal {
+    position: fixed; inset: 0; z-index: 8800;
+    background: rgba(7,9,15,.78); backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+  .exp-modal.visible { opacity: 1; pointer-events: all; }
+  .exp-box {
+    background: #0d1120; border: 1px solid #1c2740; border-radius: 14px;
+    padding: 28px 32px; width: 360px; display: flex; flex-direction: column; gap: 14px;
+    box-shadow: 0 20px 56px rgba(0,0,0,.55);
+  }
+  .exp-title { font-size: 14px; font-weight: 700; color: #e2e8f0; }
+  .exp-sub   { font-size: 11px; color: #64748b; }
+  .exp-input {
+    width: 100%; padding: 9px 12px; background: #111826; border: 1px solid #1c2740;
+    border-radius: 8px; font-size: 13px; color: #e2e8f0; outline: none;
+    transition: border-color .15s; font-family: system-ui,sans-serif;
+  }
+  .exp-input:focus { border-color: #3b7ff5; }
+  .exp-row { display: flex; gap: 8px; }
+  .exp-confirm {
+    flex: 1; padding: 9px; background: #3b7ff5; border: none; border-radius: 8px;
+    color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; font-family: system-ui,sans-serif;
+    transition: background .15s;
+  }
+  .exp-confirm:hover { background: #2563d4; }
+  .exp-cancel {
+    padding: 9px 16px; background: #111826; border: 1px solid #1c2740; border-radius: 8px;
+    color: #64748b; font-size: 13px; cursor: pointer; font-family: system-ui,sans-serif;
+  }
+  .exp-cancel:hover { color: #e2e8f0; }
+  /* Confirmation */
+  .exp-file-row { display: flex; flex-direction: column; gap: 6px; }
+  .exp-file-label { font-size: 10px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: #64748b; }
+  .exp-file-name { font-size: 12px; color: #3b7ff5; font-family: 'Consolas','Courier New',monospace; word-break: break-all; }
+  .exp-open-btn {
+    width: 100%; padding: 9px; background: none; border: 1px solid #3b7ff5; border-radius: 8px;
+    color: #3b7ff5; font-size: 13px; font-weight: 600; cursor: pointer; font-family: system-ui,sans-serif;
+    transition: background .15s, color .15s;
+  }
+  .exp-open-btn:hover { background: #3b7ff5; color: #fff; }
+
   /* ── Export banner ── */
   .export-banner {
     display: none;
@@ -1043,6 +1101,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="done-rate" id="done-rate"></div>
     <button class="done-dismiss" id="done-dismiss">Dismiss</button>
+  </div>
+</div>
+
+<!-- ── Export name prompt ── -->
+<div class="exp-modal" id="exp-name-modal">
+  <div class="exp-box">
+    <div class="exp-title">Export Results</div>
+    <div class="exp-sub">Enter a name for this run (e.g. "aurora") — used in the filename</div>
+    <input class="exp-input" id="exp-name-input" placeholder="Run name…" maxlength="40" spellcheck="false">
+    <div class="exp-row">
+      <button class="exp-cancel" id="exp-name-cancel">Cancel</button>
+      <button class="exp-confirm" id="exp-name-confirm">Export</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Export confirmation ── -->
+<div class="exp-modal" id="exp-confirm-modal">
+  <div class="exp-box">
+    <div class="exp-title">✓ Exported</div>
+    <div class="exp-file-row" id="exp-file-rows"></div>
+    <button class="exp-open-btn" id="exp-open-folder">📂 Open folder</button>
+    <button class="exp-confirm" id="exp-confirm-close">Done</button>
   </div>
 </div>
 
@@ -1403,24 +1484,47 @@ async function go(overrideKeys) {
   };
 }
 
-function showExport(files) {
+function showExportConfirm(files) {
   lastExport = files;
-  const banner = $('export-banner');
-  let html = '<strong>📄 Results saved:</strong><br>';
-  if (files.redeemed_file)
-    html += '&nbsp;&nbsp;Redeemed → <span class="export-file">' + files.redeemed_file + '</span><br>';
-  if (files.other_file)
-    html += '&nbsp;&nbsp;Others&nbsp;&nbsp; → <span class="export-file">' + files.other_file + '</span>';
-  banner.innerHTML = html;
-  banner.classList.add('visible');
+  const rows = $('exp-file-rows');
+  rows.innerHTML = '';
+  const add = (label, name) => {
+    if (!name) return;
+    const d = document.createElement('div');
+    d.className = 'exp-file-row';
+    d.innerHTML = '<div class="exp-file-label">' + label + '</div>' +
+                  '<div class="exp-file-name">' + name + '</div>';
+    rows.appendChild(d);
+  };
+  add('Redeemed', files.redeemed_file);
+  add('Others', files.other_file);
+  $('exp-confirm-modal').classList.add('visible');
 }
 
-async function exportNow() {
+// Auto-export SSE notification — show confirmation immediately
+function showExport(files) { showExportConfirm(files); }
+
+// Export button → name prompt → export → confirmation
+function exportNow() {
   if (!jobId) return;
-  const r = await (await post('/api/export/' + jobId, {})).json();
-  if (r.error) { alert('Export failed: ' + r.error); return; }
-  showExport(r);
+  $('exp-name-input').value = '';
+  $('exp-name-modal').classList.add('visible');
+  setTimeout(() => $('exp-name-input').focus(), 50);
 }
+
+async function doExport() {
+  const name = $('exp-name-input').value.trim();
+  $('exp-name-modal').classList.remove('visible');
+  const r = await (await post('/api/export/' + jobId, { name })).json();
+  if (r.error) { alert('Export failed: ' + r.error); return; }
+  showExportConfirm(r);
+}
+
+$('exp-name-confirm').addEventListener('click', doExport);
+$('exp-name-cancel').addEventListener('click',  () => $('exp-name-modal').classList.remove('visible'));
+$('exp-name-input').addEventListener('keydown', e => { if (e.key === 'Enter') doExport(); });
+$('exp-confirm-close').addEventListener('click', () => $('exp-confirm-modal').classList.remove('visible'));
+$('exp-open-folder').addEventListener('click',  () => post('/api/open-folder', {}));
 
 async function togglePause() {
   if (pauseState === 1) return;
